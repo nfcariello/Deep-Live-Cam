@@ -410,6 +410,26 @@ def check_and_ignore_nsfw(target, destroy: Optional[Callable] = None) -> bool:
 # ─── camera enumeration (unchanged from tk version) ──────────────────────
 
 
+# Devices whose live feed takes seconds to warm up (an iPhone/iPad joining over
+# Continuity Camera starts as an all-black feed). We avoid selecting one of
+# these by default so the first Live click doesn't look like a black-screen
+# failure.
+_CONTINUITY_CAMERA_HINTS = ("iphone", "ipad", "continuity", "desk view")
+
+
+def _preferred_camera_position(names: List[str]) -> int:
+    """Return the list position of the camera to select by default.
+
+    Prefers a built-in / USB webcam over an iPhone "Continuity Camera", whose
+    slow warm-up otherwise shows as a black live preview. Falls back to the
+    first camera when every device looks like a Continuity device.
+    """
+    for pos, name in enumerate(names):
+        if not any(hint in name.lower() for hint in _CONTINUITY_CAMERA_HINTS):
+            return pos
+    return 0
+
+
 def get_available_cameras() -> Tuple[List[int], List[str]]:
     if platform.system() == "Windows":
         try:
@@ -423,6 +443,17 @@ def get_available_cameras() -> Tuple[List[int], List[str]]:
             return [], ["No cameras found"]
 
     if platform.system() == "Darwin":
+        # Enumerate real device names (e.g. "MacBook Pro Camera",
+        # "<name>'s iPhone Camera") so the user can tell them apart, instead of
+        # opaque "Camera 0 / Camera 1" labels.
+        try:
+            from cv2_enumerate_cameras import enumerate_cameras
+            cameras = list(enumerate_cameras(cv2.CAP_AVFOUNDATION))
+            if cameras:
+                return [c.index for c in cameras], [c.name for c in cameras]
+        except Exception as exc:
+            print(f"Error detecting cameras: {exc}")
+        # Fallback to the two most common AVFoundation indices.
         return [0, 1], ["Camera 0", "Camera 1"]
 
     # Linux probe
@@ -694,7 +725,7 @@ class MainWindow(QMainWindow):
         self.btn_destroy = QPushButton(_("Destroy"))
         self.btn_destroy.setObjectName("danger")
         self.btn_destroy.setToolTip(_("Stop processing and close the application"))
-        self.btn_destroy.clicked.connect(lambda: self._destroy_cb())
+        self.btn_destroy.clicked.connect(self._safe_destroy)
 
         self.btn_preview = QPushButton(_("Preview"))
         self.btn_preview.setObjectName("secondary")
@@ -722,6 +753,11 @@ class MainWindow(QMainWindow):
             cam_ok = False
         else:
             self.cb_camera.addItems(self._camera_names)
+            # Default to a built-in/USB camera rather than an iPhone Continuity
+            # Camera, whose slow warm-up looks like a black-screen failure.
+            self.cb_camera.setCurrentIndex(
+                _preferred_camera_position(self._camera_names)
+            )
             cam_ok = True
         self.cb_camera.setToolTip(_("Select which camera to use for live mode"))
         layout.addWidget(self.cb_camera, 1)
@@ -946,9 +982,33 @@ class MainWindow(QMainWindow):
             modules.globals.source_target_map = []
             _open_live_mapper_dialog(camera_index, modules.globals.source_target_map)
 
+    def _safe_destroy(self) -> None:
+        """Shut the app down without aborting on a running worker thread.
+
+        core.destroy() ends with the builtin quit(), which raises SystemExit
+        from inside the Qt slot and tears the interpreter down while the live
+        preview's QThreads may still be running — a fatal Qt abort. Instead we
+        stop the preview, run core's cleanup with to_quit=False, then end the
+        event loop via QApplication.quit(); the clean exec() return routes
+        through _Window.mainloop()'s hard exit.
+        """
+        _shutdown_live_preview()
+        try:
+            self._destroy_cb(to_quit=False)
+        except TypeError:
+            # Callback doesn't accept the flag — fall back, swallowing the
+            # SystemExit its builtin quit() would raise.
+            try:
+                self._destroy_cb()
+            except SystemExit:
+                pass
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
     def closeEvent(self, event):
-        # Treat OS-level close as Destroy click
-        self._destroy_cb()
+        # Treat OS-level close as a Destroy click (clean shutdown, no abort).
+        self._safe_destroy()
         event.accept()
 
 
@@ -1017,8 +1077,46 @@ class PreviewWindow(QWidget):
 # ─── webcam preview window ───────────────────────────────────────────────
 
 
+# Workers still running at window-close time (e.g. blocked in a stalled
+# cap.read()) are parked here so Qt never destroys a running QThread — doing so
+# aborts the whole process (SIGABRT). Each worker's `finished` signal drops its
+# own reference for normal garbage collection.
+_ORPHANED_WORKERS: List[QThread] = []
+
+
+def _orphan_worker(worker: QThread) -> None:
+    _ORPHANED_WORKERS.append(worker)
+
+    def _drop() -> None:
+        try:
+            _ORPHANED_WORKERS.remove(worker)
+        except ValueError:
+            pass
+
+    worker.finished.connect(_drop)
+
+
+def _shutdown_live_preview() -> None:
+    """Best-effort stop of the live preview's worker threads before the app
+    exits. Runs on QApplication.aboutToQuit so the camera is released and
+    workers are joined regardless of how the app was quit (Destroy button,
+    Cmd-Q, window close)."""
+    preview = _WEBCAM_PREVIEW
+    if preview is not None:
+        try:
+            preview.close()
+        except Exception:
+            pass
+
+
 class _CaptureWorker(QThread):
-    """Reads frames from the camera into a bounded queue. Drops on overflow."""
+    """Reads frames from the camera into a bounded queue. Drops on overflow.
+
+    Owns the capture device: this is the only thread that calls read(), and it
+    releases the device when its loop exits. Keeping the camera off the UI
+    thread means closing the window never races a release() against an in-flight
+    read() (which can crash the AVFoundation backend on macOS).
+    """
 
     def __init__(self, cap, capture_queue: queue.Queue, stop_event: threading.Event):
         super().__init__()
@@ -1027,22 +1125,29 @@ class _CaptureWorker(QThread):
         self._stop = stop_event
 
     def run(self) -> None:
-        while not self._stop.is_set():
-            ret, frame = self._cap.read()
-            if not ret:
-                self._stop.set()
-                break
-            try:
-                self._queue.put_nowait(frame)
-            except queue.Full:
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    pass
+        try:
+            while not self._stop.is_set():
+                ret, frame = self._cap.read()
+                if not ret:
+                    self._stop.set()
+                    break
                 try:
                     self._queue.put_nowait(frame)
                 except queue.Full:
-                    pass
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self._queue.put_nowait(frame)
+                    except queue.Full:
+                        pass
+        finally:
+            # Release on the same thread that reads — never cross-thread.
+            try:
+                self._cap.release()
+            except Exception:
+                pass
 
 
 class _ProcessingWorker(QThread):
@@ -1186,6 +1291,7 @@ class _ProcessingWorker(QThread):
 class WebcamPreviewWindow(QWidget):
     def __init__(self, camera_index: int):
         super().__init__()
+        self._workers_started = False
         self.setWindowTitle("Live Preview")
         self.resize(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT)
         layout = QVBoxLayout(self)
@@ -1219,6 +1325,7 @@ class WebcamPreviewWindow(QWidget):
         )
         self._capture_worker.start()
         self._processing_worker.start()
+        self._workers_started = True
 
         # Poll at ~2x camera fps so we never block but also don't burn CPU.
         poll_ms = max(1, min(16, int(500 / max(camera_fps, 1))))
@@ -1238,23 +1345,36 @@ class WebcamPreviewWindow(QWidget):
         self._image_label.setPixmap(_bgr_to_qpixmap(bgr_frame))
 
     def closeEvent(self, event) -> None:
+        global _WEBCAM_PREVIEW
+        if _WEBCAM_PREVIEW is self:
+            _WEBCAM_PREVIEW = None
+
+        # Camera never started (start() failed): nothing was created to tear
+        # down, so releasing the VideoCapturer is the only cleanup needed.
+        if not self._workers_started:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+            event.accept()
+            return
+
         self._stop_event.set()
         try:
             self._timer.stop()
         except Exception:
             pass
-        for worker in (self._capture_worker, self._processing_worker):
-            try:
-                worker.wait(2000)
-            except Exception:
-                pass
-        try:
-            self._cap.release()
-        except Exception:
-            pass
-        global _WEBCAM_PREVIEW
-        if _WEBCAM_PREVIEW is self:
-            _WEBCAM_PREVIEW = None
+
+        # Wait briefly for a clean exit. The capture worker can be stuck inside
+        # a blocking cap.read() (macOS camera stall / Continuity hand-off) that
+        # the stop flag can't interrupt; if it hasn't finished, orphan it so Qt
+        # never destroys a still-running QThread (which aborts the process).
+        # The worker owns the camera and releases it when read() finally
+        # returns, so we never touch the capture device from this thread.
+        for worker in (self._processing_worker, self._capture_worker):
+            if not worker.wait(1500):
+                _orphan_worker(worker)
+
         event.accept()
 
 
@@ -1525,7 +1645,16 @@ class _Window:
 
     def mainloop(self) -> None:
         self._main.show()
-        self._app.exec()
+        try:
+            self._app.exec()
+        finally:
+            # A background QThread still alive during normal interpreter
+            # shutdown triggers a fatal Qt abort ("QThread: Destroyed while
+            # thread is still running"). Once the event loop has ended the app
+            # is exiting anyway, so exit hard to bypass that teardown entirely.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
 
 
 def init(
@@ -1539,6 +1668,7 @@ def init(
     else:
         _APP = QApplication.instance()
     _APP.setStyleSheet(QSS)
+    _APP.aboutToQuit.connect(_shutdown_live_preview)
 
     _BRIDGE = _UIBridge()
     _MAIN = MainWindow(start, destroy)
