@@ -185,7 +185,18 @@ def limit_resources() -> None:
             kernel32.SetProcessWorkingSetSize(-1, ctypes.c_size_t(memory), ctypes.c_size_t(memory))
         else:
             import resource
-            resource.setrlimit(resource.RLIMIT_DATA, (memory, memory))
+            # Only lower the soft limit; keep the existing hard limit so a
+            # non-root process is never asked to raise it. macOS rejects
+            # setrlimit(RLIMIT_DATA) with EINVAL regardless of the value (surfaced
+            # by CPython as ValueError), and the cap is best-effort, so a failure
+            # here must not take down startup.
+            soft, hard = resource.getrlimit(resource.RLIMIT_DATA)
+            if hard != resource.RLIM_INFINITY:
+                memory = min(memory, hard)
+            try:
+                resource.setrlimit(resource.RLIMIT_DATA, (memory, hard))
+            except (ValueError, OSError) as exc:
+                print(f'[DLC.CORE] Could not set memory limit ({exc}); continuing without it.')
 
 
 def release_resources() -> None:
