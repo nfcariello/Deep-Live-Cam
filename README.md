@@ -132,6 +132,24 @@ Perfect if you want the fastest setup with **zero manual installation**, pre-con
 
 **Please be aware that the installation requires technical skills and is not for beginners. Consider downloading the quickstart version.**
 
+> ### Notes for this fork (macOS fixes)
+>
+> This fork adds macOS-specific fixes on top of upstream Deep-Live-Cam:
+>
+> - **Startup no longer crashes on macOS.** `limit_resources()` called
+>   `setrlimit(RLIMIT_DATA)`, which the macOS kernel rejects with `EINVAL` —
+>   crashing before the window opened. It's now applied safely (soft limit only)
+>   and treated as best-effort.
+> - **The live-camera picker shows real device names** (was hardcoded
+>   "Camera 0 / Camera 1") and **defaults to the built-in camera** instead of an
+>   iPhone Continuity Camera, whose slow warm-up looked like a black screen.
+> - **The live preview no longer crashes on close / Destroy / quit** — fixed a
+>   `QThread` teardown abort (`QThread: Destroyed while thread is still running`).
+>
+> The macOS instructions below reflect the setup actually verified on this fork
+> (**Python 3.12**, CoreML on Apple Silicon). See **Important Notes for macOS**
+> for day-to-day usage.
+
 <details>
 <summary>Click to see the process</summary>
 
@@ -156,10 +174,11 @@ cd Deep-Live-Cam
 
 **3. Download the Models**
 
+This step is **optional** — the app auto-downloads the models it needs on first
+use. To pre-place them manually instead, download these into the "**models**" folder:
+
 1. [GFPGANv1.4](https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx)
 2. [inswapper\_128\_fp16.onnx](https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx)
-
-Place these files in the "**models**" folder.
 
 **4. Install Dependencies**
 
@@ -182,43 +201,44 @@ pip install -r requirements.txt
 
 **For macOS:**
 
-Apple Silicon (M1 through M5) requires specific setup:
+Apple Silicon (M1 through M5):
 
 ```bash
-# Install Python 3.14
-brew install python@3.14
+# Install a supported Python (3.11-3.13 all work; 3.12 is verified on this fork).
+# Use Homebrew (below) or the python.org universal2 installer.
+brew install python@3.12
 
-# Install tkinter package (required for the GUI)
-brew install python-tk@3.14
+# ffmpeg is required for video import/export.
+brew install ffmpeg
 
-# Create and activate virtual environment with Python 3.14
-python3.14 -m venv venv
+# Create and activate the virtual environment
+python3.12 -m venv venv
 source venv/bin/activate
 
-# Install dependencies
+# Install dependencies (compiles insightface; ~2-3 min on first install)
 pip install -r requirements.txt
 ```
+
+> The GUI uses **PySide6/Qt** — you do **not** need tkinter / `python-tk`.
+> Models **download automatically** on first use (~2 GB, one-time); there's no
+> manual model-download step on macOS.
 
 ** In case something goes wrong and you need to reinstall the virtual environment **
 
 ```bash
-# Deactivate the virtual environment
+# Remove and recreate the virtual environment
 rm -rf venv
-
-# Reinstall the virtual environment
-python -m venv venv
+python3.12 -m venv venv
 source venv/bin/activate
 
-# install the dependencies again
+# Install the dependencies again
 pip install -r requirements.txt
-
-# gfpgan and basicsrs issue fix
-pip install git+https://github.com/xinntao/BasicSR.git@master
-pip uninstall gfpgan -y
-pip install git+https://github.com/TencentARC/GFPGAN.git@master
 ```
 
-**Run:** If you don't have a GPU, you can run Deep-Live-Cam using `python run.py`. Note that initial execution will download models (~300MB).
+> The face enhancers (GFPGAN / GPEN) are **ONNX-based** on this build — you do
+> **not** need the old torch-based `BasicSR` / `gfpgan` packages.
+
+**Run:** If you don't have a GPU, you can run Deep-Live-Cam using `python run.py`. Note that the first run auto-downloads the required models (face detector + swapper, up to ~2 GB in total; more if you enable a face enhancer).
 
 ### GPU Acceleration
 
@@ -246,7 +266,7 @@ python run.py --execution-provider cuda
 
 Apple Silicon (M1 through M5) specific installation:
 
-1. Make sure you've completed the macOS setup above using Python 3.14.
+1. Make sure you've completed the macOS setup above (Python 3.11-3.13).
 2. No extra install step is needed — `requirements.txt` pulls the official
    `onnxruntime` build, whose macOS wheels ship the CoreML execution provider.
    If you previously installed the unmaintained `onnxruntime-silicon` fork,
@@ -257,28 +277,27 @@ pip uninstall onnxruntime-silicon
 pip install -r requirements.txt
 ```
 
-3. Usage:
+3. Usage (CoreML is auto-selected on Apple Silicon, so the flag is optional):
 
 ```bash
-python3.14 run.py --execution-provider coreml
+python run.py --execution-provider coreml
 ```
 
 **Important Notes for macOS:**
-- Python 3.11 is the minimum (onnxruntime dropped 3.10); 3.14 is recommended
-- Always run with `python3.14` command not just `python` if you have multiple Python versions installed
-- If you get error about `_tkinter` missing, reinstall the tkinter package: `brew reinstall python-tk@3.14`
-- If you get model loading errors, check that your models are in the correct folder
-- If you encounter conflicts with other Python versions, consider uninstalling them:
-  ```bash
-  # List all installed Python versions
-  brew list | grep python
-
-  # Uninstall conflicting versions if needed
-  brew uninstall --ignore-dependencies python@3.11
-
-  # Keep only Python 3.14
-  brew cleanup
-  ```
+- **Python:** 3.11 is the minimum (onnxruntime dropped 3.10); 3.11-3.13 all work,
+  and this fork is verified on **3.12**. If you have several Pythons installed,
+  create the venv with an explicit version so it's unambiguous:
+  `python3.12 -m venv venv`.
+- **ffmpeg is required** (`brew install ffmpeg`) for importing/exporting video.
+- **First run downloads ~2 GB of models** (face detector + swapper) the first time
+  you click **Live** or **Start**. The window can look frozen while it downloads
+  and then compiles the CoreML models (a one-time ~9 s init) — this is expected,
+  not a crash. Enabling a **face enhancer** downloads and loads an extra model too.
+- **Camera selection:** the camera dropdown lists your cameras by name and defaults
+  to the built-in camera. An **iPhone (Continuity Camera)** shows an all-black feed
+  for ~1-2 s while it warms up, so prefer the built-in "… Camera" for an instant
+  preview. macOS prompts for **camera permission** the first time — allow it.
+- No tkinter is needed (the UI is PySide6/Qt).
 
 **CoreML Execution Provider (Apple Legacy)**
 
