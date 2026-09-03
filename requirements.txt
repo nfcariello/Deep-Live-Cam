@@ -16,3 +16,7 @@ opennsfw2==0.18.0
 keras>=3.0.0
 protobuf>=6.33.5,<8
 pygrabber; sys_platform == 'win32'
+# Optional virtual-camera output (feeds the live swap to Teams/Zoom/etc.).
+# Needs a system backend at runtime (macOS/Windows: OBS Virtual Camera;
+# Linux: v4l2loopback). The app runs fine without a backend installed.
+pyvirtualcam==0.15.0

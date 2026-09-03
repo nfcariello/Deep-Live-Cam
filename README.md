@@ -145,6 +145,10 @@ Perfect if you want the fastest setup with **zero manual installation**, pre-con
 >   iPhone Continuity Camera, whose slow warm-up looked like a black screen.
 > - **The live preview no longer crashes on close / Destroy / quit** — fixed a
 >   `QThread` teardown abort (`QThread: Destroyed while thread is still running`).
+> - **Virtual camera output** — a "Virtual Camera (Teams/Zoom)" toggle in the
+>   live-preview window feeds the swapped video to a system virtual camera, so
+>   you can use it as your webcam in Teams, Zoom, Meet, etc. See
+>   **[Virtual camera output (Teams / Zoom / Meet)](#virtual-camera-output-teams--zoom--meet)**.
 >
 > The macOS instructions below reflect the setup actually verified on this fork
 > (**Python 3.12**, CoreML on Apple Silicon). See **Important Notes for macOS**
@@ -298,6 +302,50 @@ python run.py --execution-provider coreml
   for ~1-2 s while it warms up, so prefer the built-in "… Camera" for an instant
   preview. macOS prompts for **camera permission** the first time — allow it.
 - No tkinter is needed (the UI is PySide6/Qt).
+
+### Virtual camera output (Teams / Zoom / Meet)
+
+You can send the live face-swapped video into a **virtual camera** and select it
+as your webcam in Teams, Zoom, Meet, Discord, OBS, etc.
+
+**How it works:** Deep-Live-Cam pushes swapped frames to a system virtual-camera
+device through the [`pyvirtualcam`](https://pypi.org/project/pyvirtualcam/) library
+(already in `requirements.txt`). `pyvirtualcam` doesn't create the device itself —
+it writes into a backend that the OS exposes as a real camera. On **macOS** (and
+Windows) that backend is the **OBS Virtual Camera**.
+
+**Install / configure (macOS):**
+
+1. **Install OBS Studio** (free) from [obsproject.com](https://obsproject.com) —
+   you never have to open it during calls; it's only there to provide the
+   virtual-camera device.
+2. **Launch OBS once** and approve its camera **system extension** when macOS
+   prompts: **System Settings → General → Login Items & Extensions → Camera
+   Extensions → enable "OBS Virtual Camera."** (On older macOS this appears under
+   **Privacy & Security → Allow**.) This one-time approval is what registers the
+   device.
+3. **Do _not_ run OBS's own "Start Virtual Camera"** — Deep-Live-Cam feeds the
+   device directly, and only one app can produce to it at a time.
+
+**Use it:**
+
+1. In Deep-Live-Cam, select a source face, pick your real camera, and click
+   **Live**.
+2. In the live-preview window, tick **"Virtual Camera (Teams/Zoom)."** The status
+   bar confirms it started (or tells you what's missing).
+3. In Teams/Zoom/etc., **quit and reopen the app** (they only scan for cameras at
+   launch), then choose **"OBS Virtual Camera"** in the camera settings.
+
+**Notes:**
+
+- If the toggle reports it can't open the device, it's almost always because OBS
+  isn't installed / the extension isn't approved, or OBS's own virtual camera is
+  still running — turn that off.
+- **Teams:** the new Teams desktop app on macOS lists the OBS Virtual Camera once
+  the extension is approved; if it doesn't appear, restart Teams. Teams in a
+  browser (Chrome/Edge) also works.
+- Everything degrades gracefully: if `pyvirtualcam` or a backend is missing, the
+  toggle just reports it and the rest of the app is unaffected.
 
 **CoreML Execution Provider (Apple Legacy)**
 

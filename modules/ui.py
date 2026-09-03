@@ -75,6 +75,7 @@ from modules.utilities import (
 )
 from modules import imread_unicode
 from modules.video_capture import VideoCapturer
+from modules.virtual_camera import VirtualCamera
 
 if platform.system() == "Windows":
     from pygrabber.dshow_graph import FilterGraph
@@ -1292,10 +1293,24 @@ class WebcamPreviewWindow(QWidget):
     def __init__(self, camera_index: int):
         super().__init__()
         self._workers_started = False
+        self._vcam = VirtualCamera()
         self.setWindowTitle("Live Preview")
         self.resize(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+
+        # Top bar: send the swapped feed to a virtual camera (Teams/Zoom/etc.).
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(8, 6, 8, 6)
+        self._vcam_checkbox = QCheckBox(_("Virtual Camera (Teams/Zoom)"))
+        self._vcam_checkbox.setToolTip(
+            _("Send the swapped video to a virtual camera other apps can select")
+        )
+        self._vcam_checkbox.toggled.connect(self._on_toggle_virtual_cam)
+        top_bar.addWidget(self._vcam_checkbox)
+        top_bar.addStretch(1)
+        layout.addLayout(top_bar)
+
         self._image_label = QLabel()
         self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -1333,6 +1348,25 @@ class WebcamPreviewWindow(QWidget):
         self._timer.timeout.connect(self._tick)
         self._timer.start(poll_ms)
 
+    def _on_toggle_virtual_cam(self, checked: bool) -> None:
+        if checked:
+            if not self._workers_started:
+                return
+            ok, msg = self._vcam.start(
+                self._cap.actual_width,
+                self._cap.actual_height,
+                self._cap.actual_fps,
+            )
+            update_status(msg)
+            if not ok:
+                # Revert the checkbox without re-triggering this handler.
+                self._vcam_checkbox.blockSignals(True)
+                self._vcam_checkbox.setChecked(False)
+                self._vcam_checkbox.blockSignals(False)
+        else:
+            self._vcam.close()
+            update_status("Virtual camera stopped")
+
     def _tick(self) -> None:
         if self._stop_event.is_set():
             self.close()
@@ -1341,6 +1375,9 @@ class WebcamPreviewWindow(QWidget):
             bgr_frame = self._processed_queue.get_nowait()
         except queue.Empty:
             return
+        # Feed the virtual camera at capture resolution (before fit-to-window).
+        if self._vcam.is_running:
+            self._vcam.send(bgr_frame)
         bgr_frame = fit_image_to_size(bgr_frame, self.width(), self.height())
         self._image_label.setPixmap(_bgr_to_qpixmap(bgr_frame))
 
@@ -1348,6 +1385,9 @@ class WebcamPreviewWindow(QWidget):
         global _WEBCAM_PREVIEW
         if _WEBCAM_PREVIEW is self:
             _WEBCAM_PREVIEW = None
+
+        # Release the virtual camera first (covers every teardown path).
+        self._vcam.close()
 
         # Camera never started (start() failed): nothing was created to tear
         # down, so releasing the VideoCapturer is the only cleanup needed.
